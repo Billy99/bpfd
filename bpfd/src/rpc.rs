@@ -7,12 +7,12 @@ use std::{
 
 use bpfd_api::{
     v1::{
+        attach_info::Info,
         bpfd_server::Bpfd,
-        list_response::{list_result, list_result::AttachInfo, ListResult},
-        load_request,
-        load_request_common::Location,
-        KprobeAttachInfo, ListRequest, ListResponse, LoadRequest, LoadResponse,
-        PullBytecodeRequest, PullBytecodeResponse, TcAttachInfo, TracepointAttachInfo,
+        bytecode_location::Location,
+        list_response::ListResult,
+        AttachInfo, BytecodeLocation, GetRequest, GetResponse, KernelProgramInfo, KprobeAttachInfo, ListRequest, ListResponse, LoadRequest, LoadResponse,
+        ProgramInfo, PullBytecodeRequest, PullBytecodeResponse, TcAttachInfo, TracepointAttachInfo,
         UnloadRequest, UnloadResponse, UprobeAttachInfo, XdpAttachInfo,
     },
     TcProceedOn, XdpProceedOn,
@@ -45,77 +45,101 @@ impl Bpfd for BpfdLoader {
 
         let (resp_tx, resp_rx) = oneshot::channel();
 
-        if request.common.is_none() {
-            return Err(Status::aborted("missing common program info"));
-        }
-        let common = request.common.unwrap();
+        //if request.common.is_none() {
+        //    return Err(Status::aborted("missing common program info"));
+        //}
+        //let common = request.common.unwrap();
 
-        if request.attach_info.is_none() {
+        if request.attach.is_none() {
             return Err(Status::aborted("missing attach info"));
         }
-        let bytecode_source = match common.location.unwrap() {
+        let bytecode_source = match request.bytecode.unwrap().location.unwrap() {
             Location::Image(i) => crate::command::Location::Image(i.into()),
             Location::File(p) => crate::command::Location::File(p),
         };
 
-        let global_data = if common.global_data.is_empty() {
+        let global_data = if request.global_data.is_empty() {
             None
         } else {
-            Some(common.global_data)
+            Some(request.global_data)
         };
 
         let data = ProgramData::new(
             bytecode_source,
-            common.section_name,
-            common.metadata,
+            request.name,
+            request.metadata,
             global_data,
-            common.map_owner_id,
+            request.map_owner_id,
         );
 
         let load_args = LoadArgs {
-            program: match request.attach_info.unwrap() {
-                load_request::AttachInfo::XdpAttachInfo(attach) => Program::Xdp(XdpProgram::new(
-                    data,
-                    attach.priority,
-                    attach.iface,
-                    XdpProceedOn::from_int32s(attach.proceed_on)
-                        .map_err(|_| Status::aborted("failed to parse proceed_on"))?,
-                )),
-                load_request::AttachInfo::TcAttachInfo(attach) => {
-                    let direction = attach
-                        .direction
+            program: match request.attach.unwrap().info.unwrap() {
+                Info::XdpAttachInfo(XdpAttachInfo {
+                    priority,
+                    iface,
+                    position: _,
+                    proceed_on,
+                }) => {
+                    Program::Xdp(XdpProgram::new(
+                        data,
+                        priority,
+                        iface,
+                        XdpProceedOn::from_int32s(proceed_on)
+                            .map_err(|_| Status::aborted("failed to parse proceed_on"))?,
+                    ))
+                }
+                Info::TcAttachInfo(TcAttachInfo {
+                    priority,
+                    iface,
+                    position: _,
+                    direction,
+                    proceed_on,
+                }) => {
+                    let direction = direction
                         .try_into()
                         .map_err(|_| Status::aborted("direction is not a string"))?;
                     Program::Tc(TcProgram::new(
                         data,
-                        attach.priority,
-                        attach.iface,
-                        TcProceedOn::from_int32s(attach.proceed_on)
+                        priority,
+                        iface,
+                        TcProceedOn::from_int32s(proceed_on)
                             .map_err(|_| Status::aborted("failed to parse proceed_on"))?,
                         direction,
                     ))
                 }
-                load_request::AttachInfo::TracepointAttachInfo(attach) => {
-                    Program::Tracepoint(TracepointProgram::new(data, attach.tracepoint))
+                Info::TracepointAttachInfo(TracepointAttachInfo{tracepoint}) => {
+                    Program::Tracepoint(TracepointProgram::new(data, tracepoint))
                 }
-                load_request::AttachInfo::KprobeAttachInfo(attach) => {
+                Info::KprobeAttachInfo(KprobeAttachInfo{
+                    fn_name,
+                    offset,
+                    retprobe,
+                    namespace,
+                }) => {
                     Program::Kprobe(KprobeProgram::new(
                         data,
-                        attach.fn_name,
-                        attach.offset,
-                        attach.retprobe,
-                        attach.namespace,
+                        fn_name,
+                        offset,
+                        retprobe,
+                        namespace,
                     ))
                 }
-                load_request::AttachInfo::UprobeAttachInfo(attach) => {
+                Info::UprobeAttachInfo(UprobeAttachInfo{
+                    fn_name,
+                    offset,
+                    target,
+                    retprobe,
+                    pid,
+                    namespace,
+                }) => {
                     Program::Uprobe(UprobeProgram::new(
                         data,
-                        attach.fn_name,
-                        attach.offset,
-                        attach.target,
-                        attach.retprobe,
-                        attach.pid,
-                        attach.namespace,
+                        fn_name,
+                        offset,
+                        target,
+                        retprobe,
+                        pid,
+                        namespace,
                     ))
                 }
             },
@@ -129,7 +153,36 @@ impl Bpfd for BpfdLoader {
         // Await the response
         match resp_rx.await {
             Ok(res) => match res {
-                Ok(id) => Ok(Response::new(LoadResponse { id })),
+                Ok(id) => {
+                    let reply_entry = LoadResponse {
+                        info: { Some(ProgramInfo {
+                            uuid: None,
+                            metadata: HashMap::new(),
+                            name: "".to_owned(),
+                            attach: None,
+                            bytecode: None,
+                            global_data: HashMap::new(),
+                            map_owner_id: None,
+                            map_pin_path: Some("".to_owned()),
+                            map_used_by: vec![],
+                        }) },
+                        kernel_info: { Some(KernelProgramInfo {
+                            id: id,
+                            program_type: 0,
+                            loaded_at: "".to_owned(),
+                            tag: "".to_owned(),
+                            gpl_compatible: false,
+                            map_ids: vec![],
+                            btf_id: 0,
+                            bytes_xlated: 0,
+                            jited: false,
+                            bytes_jited: 0,
+                            bytes_memlock: 0,
+                            verified_insns: 0,    
+                    }) },
+                    };
+                    Ok(Response::new(reply_entry))
+                },
                 Err(e) => {
                     warn!("BPFD load error: {:#?}", e);
                     Err(Status::aborted(format!("{e}")))
@@ -176,6 +229,11 @@ impl Bpfd for BpfdLoader {
         }
     }
 
+    async fn get(&self, _request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        //let mut reply = ListResponse { results: vec![] };
+        return Err(Status::aborted("Not Implemented"));
+    }
+
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let mut reply = ListResponse { results: vec![] };
 
@@ -200,41 +258,25 @@ impl Bpfd for BpfdLoader {
                             }
                         }
 
-                        let kernel_info = r
-                            .clone()
-                            .get_kernel_info()
-                            .expect("kernel info should be set for all loaded programs");
-
-                        let mut reply_entry = ListResult {
-                            id: kernel_info.id,
+                        // Populate the Program Info with bpfd data
+                        let mut info = ProgramInfo {
+                            uuid: None,
                             metadata: HashMap::new(),
                             name: r.name(),
-                            attach_info: None,
-                            location: None,
-                            program_type,
+                            attach: None,
+                            bytecode: None,
                             global_data: HashMap::new(),
                             map_owner_id: None,
-                            map_pin_path: "".to_owned(),
+                            map_pin_path: Some("".to_owned()),
                             map_used_by: vec![],
-                            loaded_at: kernel_info.loaded_at,
-                            tag: kernel_info.tag,
-                            gpl_compatible: kernel_info.gpl_compatible,
-                            map_ids: kernel_info.map_ids,
-                            btf_id: kernel_info.btf_id,
-                            bytes_xlated: kernel_info.bytes_xlated,
-                            jited: kernel_info.jited,
-                            bytes_jited: kernel_info.bytes_jited,
-                            bytes_memlock: kernel_info.bytes_memlock,
-                            verified_insns: kernel_info.verified_insns,
                         };
 
                         match r.data_op() {
                             // Unsupported Program
                             None => {
-                                if !request.get_ref().bpfd_programs_only() {
-                                    reply.results.push(reply_entry);
+                                if request.get_ref().bpfd_programs_only() {
+                                    continue;
                                 }
-                                continue;
                             }
                             // Bpfd Program
                             Some(data) => {
@@ -256,24 +298,28 @@ impl Bpfd for BpfdLoader {
                                     continue;
                                 }
 
-                                reply_entry.metadata = data.metadata.clone();
+                                info.metadata = data.metadata.clone();
 
                                 // populate bpfd location
-                                reply_entry.location = match r.location() {
+                                info.bytecode = match r.location() {
                                     Some(l) => match l {
                                         crate::command::Location::Image(m) => {
-                                            Some(list_result::Location::Image(
-                                                bpfd_api::v1::BytecodeImage {
-                                                    url: m.get_url().to_string(),
-                                                    image_pull_policy: m.get_pull_policy() as i32,
-                                                    // Never dump Plaintext Credentials
-                                                    username: "".to_string(),
-                                                    password: "".to_string(),
-                                                },
-                                            ))
+                                            Some(BytecodeLocation {
+                                                location: Some(Location::Image(
+                                                    bpfd_api::v1::BytecodeImage {
+                                                        url: m.get_url().to_string(),
+                                                        image_pull_policy: m.get_pull_policy() as i32,
+                                                        // Never dump Plaintext Credentials
+                                                        username: Some("".to_string()),
+                                                        password: Some("".to_string()),
+                                                    },
+                                                ))
+                                            })
                                         }
                                         crate::command::Location::File(m) => {
-                                            Some(list_result::Location::File(m))
+                                            Some(BytecodeLocation {
+                                                location: Some(Location::File(m))
+                                            })
                                         }
                                     },
                                     None => {
@@ -285,69 +331,106 @@ impl Bpfd for BpfdLoader {
                                     }
                                 };
 
-                                reply_entry.attach_info = match r.clone() {
-                                    Program::Xdp(p) => {
-                                        Some(AttachInfo::XdpAttachInfo(XdpAttachInfo {
-                                            priority: p.priority,
-                                            iface: p.iface,
-                                            position: p.current_position.unwrap_or(0) as i32,
-                                            proceed_on: p.proceed_on.as_action_vec(),
-                                        }))
-                                    }
-                                    Program::Tc(p) => {
-                                        Some(AttachInfo::TcAttachInfo(TcAttachInfo {
-                                            priority: p.priority,
-                                            iface: p.iface,
-                                            position: p.current_position.unwrap_or(0) as i32,
-                                            direction: p.direction.to_string(),
-                                            proceed_on: p.proceed_on.as_action_vec(),
-                                        }))
-                                    }
-                                    Program::Tracepoint(p) => Some(
-                                        AttachInfo::TracepointAttachInfo(TracepointAttachInfo {
-                                            tracepoint: p.tracepoint,
-                                        }),
-                                    ),
-                                    Program::Kprobe(p) => {
-                                        Some(AttachInfo::KprobeAttachInfo(KprobeAttachInfo {
-                                            fn_name: p.fn_name,
-                                            offset: p.offset,
-                                            retprobe: p.retprobe,
-                                            namespace: p.namespace,
-                                        }))
-                                    }
-                                    Program::Uprobe(p) => {
-                                        Some(AttachInfo::UprobeAttachInfo(UprobeAttachInfo {
-                                            fn_name: p.fn_name,
-                                            offset: p.offset,
-                                            target: p.target,
-                                            retprobe: p.retprobe,
-                                            pid: p.pid,
-                                            namespace: p.namespace,
-                                        }))
-                                    }
-                                    Program::Unsupported(_) => None,
+                                let attach_info = AttachInfo {
+                                    info: match r.clone() {
+                                        Program::Xdp(p) => {
+                                            Some(Info::XdpAttachInfo(
+                                                XdpAttachInfo {
+                                                    priority: p.priority,
+                                                    iface: p.iface,
+                                                    position: p.current_position.unwrap_or(0) as i32,
+                                                    proceed_on: p.proceed_on.as_action_vec(),
+                                                },
+                                            ))
+                                        }
+                                        Program::Tc(p) => {
+                                            Some(Info::TcAttachInfo(
+                                                TcAttachInfo {
+                                                    priority: p.priority,
+                                                    iface: p.iface,
+                                                    position: p.current_position.unwrap_or(0) as i32,
+                                                    direction: p.direction.to_string(),
+                                                    proceed_on: p.proceed_on.as_action_vec(),
+                                                },
+                                            ))
+                                        }
+                                        Program::Tracepoint(p) => {
+                                            Some(Info::TracepointAttachInfo(
+                                                TracepointAttachInfo {
+                                                    tracepoint: p.tracepoint,
+                                                },
+                                            ))
+                                        }
+                                        Program::Kprobe(p) => {
+                                            Some(Info::KprobeAttachInfo(
+                                                KprobeAttachInfo {
+                                                    fn_name: p.fn_name,
+                                                    offset: p.offset,
+                                                    retprobe: p.retprobe,
+                                                    namespace: p.namespace,
+                                                },
+                                            ))
+                                        }
+                                        Program::Uprobe(p) => {
+                                            Some(Info::UprobeAttachInfo(
+                                                UprobeAttachInfo {
+                                                    fn_name: p.fn_name,
+                                                    offset: p.offset,
+                                                    target: p.target,
+                                                    retprobe: p.retprobe,
+                                                    pid: p.pid,
+                                                    namespace: p.namespace,
+                                                },
+                                            ))
+                                        }
+                                        Program::Unsupported(_) => None,
+                                    },
                                 };
+                                info.attach = Some(attach_info);
 
                                 // Map ID to String for response
-                                reply_entry.map_owner_id = r.data().map_owner_id;
+                                info.map_owner_id = r.data().map_owner_id;
 
                                 // Map Vec<ID> to Vec<String> for response
                                 if let Some(id_list) = r.data().map_used_by.clone() {
                                     for ref_id in id_list {
-                                        reply_entry.map_used_by.push(ref_id.to_string());
+                                        info.map_used_by.push(ref_id.to_string());
                                     }
                                 };
 
                                 // Copy map_pin_path if it is set.
                                 if let Some(map_pin_path) = r.data().map_pin_path.clone() {
-                                    reply_entry.map_pin_path =
-                                        map_pin_path.into_os_string().into_string().unwrap();
+                                    info.map_pin_path =
+                                        Some(map_pin_path.into_os_string().into_string().unwrap());
                                 };
-
-                                reply.results.push(reply_entry)
                             }
                         }
+
+                        // Get the Kernel Info.
+                        let kernel_info = r
+                            .clone()
+                            .get_kernel_info()
+                            .expect("kernel info should be set for all loaded programs");
+
+                        // Populate the response with the Program Info and the Kernel Info.
+                        let reply_entry = ListResult {
+                            info: Some(info),
+                            kernel_info: { Some(KernelProgramInfo {
+                                id: kernel_info.id,
+                                program_type,
+                                loaded_at: kernel_info.loaded_at,
+                                tag: kernel_info.tag,
+                                gpl_compatible: kernel_info.gpl_compatible,
+                                map_ids: kernel_info.map_ids,
+                                btf_id: kernel_info.btf_id,
+                                bytes_xlated: kernel_info.bytes_xlated,
+                                jited: kernel_info.jited,
+                                bytes_jited: kernel_info.bytes_jited,
+                                bytes_memlock: kernel_info.bytes_memlock,
+                                verified_insns: kernel_info.verified_insns,    
+                            }) },
+                        };
+                        reply.results.push(reply_entry)
                     }
                     Ok(Response::new(reply))
                 }

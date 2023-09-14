@@ -9,14 +9,12 @@ use bpfd_api::{
     config::{self, Config},
     util::directories::*,
     v1::{
+        attach_info::Info,
         bpfd_client::BpfdClient,
-        list_response::{
-            list_result::{AttachInfo as ListAttachInfo, Location},
-            ListResult,
-        },
-        load_request::{self, AttachInfo as LoadAttachInfo},
-        load_request_common, BytecodeImage, KprobeAttachInfo, ListRequest, LoadRequest,
-        LoadRequestCommon, PullBytecodeRequest, TcAttachInfo, TracepointAttachInfo, UnloadRequest,
+        bytecode_location::Location,
+        list_response::ListResult,
+        AttachInfo, BytecodeImage, BytecodeLocation, KprobeAttachInfo, ListRequest, LoadRequest,
+        PullBytecodeRequest, TcAttachInfo, TracepointAttachInfo, UnloadRequest,
         UprobeAttachInfo, XdpAttachInfo,
     },
     ImagePullPolicy,
@@ -321,8 +319,8 @@ impl TryFrom<&PullBytecodeArgs> for BytecodeImage {
         Ok(BytecodeImage {
             url: value.image_url.clone(),
             image_pull_policy: pull_policy.into(),
-            username,
-            password,
+            username: Some(username),
+            password: Some(password),
         })
     }
 }
@@ -352,11 +350,39 @@ impl ProgTable {
             .add_attribute(comfy_table::Attribute::Bold)
             .fg(Color::Green)]);
 
-        if r.metadata.is_empty() {
+        if r.info.is_none() {
+            table.add_row(vec!["NONE"]);
+            return Ok(ProgTable(table));
+        }
+        let info = r.info.clone().unwrap();
+
+        if info.bytecode.is_none() {
+            table.add_row(vec!["NONE"]);
+            return Ok(ProgTable(table));
+        } else {
+            match info.bytecode.clone().unwrap().location.clone() {
+                Some(l) => match l {
+                    Location::Image(i) => {
+                        table.add_row(vec!["Image URL:", &i.url]);
+                        table.add_row(vec!["Pull Policy:", &format!{ "{}", TryInto::<ImagePullPolicy>::try_into(i.image_pull_policy)?}]);
+                    }
+                    Location::File(p) => {
+                        table.add_row(vec!["Path:", &p]);
+                    }
+                },
+                // not a bpfd program
+                None => {
+                    table.add_row(vec!["NONE"]);
+                    return Ok(ProgTable(table));
+                }
+            }
+        }
+
+        if info.metadata.is_empty() {
             table.add_row(vec!["Metadata:", "None"]);
         } else {
             let mut first = true;
-            for (key, value) in r.metadata.clone() {
+            for (key, value) in info.metadata.clone() {
                 let data = &format! {"{key}={}", encode_upper(value)};
                 if first {
                     first = false;
@@ -367,28 +393,11 @@ impl ProgTable {
             }
         }
 
-        match r.location.clone() {
-            Some(l) => match l {
-                Location::Image(i) => {
-                    table.add_row(vec!["Image URL:", &i.url]);
-                    table.add_row(vec!["Pull Policy:", &format!{ "{}", TryInto::<ImagePullPolicy>::try_into(i.image_pull_policy)?}]);
-                }
-                Location::File(p) => {
-                    table.add_row(vec!["Path:", &p]);
-                }
-            },
-            // not a bpfd program
-            None => {
-                table.add_row(vec!["NONE"]);
-                return Ok(ProgTable(table));
-            }
-        }
-
-        if r.global_data.is_empty() {
+        if info.global_data.is_empty() {
             table.add_row(vec!["Global:", "None"]);
         } else {
             let mut first = true;
-            for (key, value) in r.global_data.clone() {
+            for (key, value) in info.global_data.clone() {
                 let data = &format! {"{key}={}", encode_upper(value)};
                 if first {
                     first = false;
@@ -399,28 +408,28 @@ impl ProgTable {
             }
         }
 
-        if r.map_pin_path.is_empty() {
+        if info.map_pin_path.is_none() || info.map_pin_path.clone().unwrap().is_empty() {
             table.add_row(vec!["Map Pin Path:", "None"]);
         } else {
-            table.add_row(vec!["Map Pin Path:", &r.map_pin_path]);
+            table.add_row(vec!["Map Pin Path:", &info.map_pin_path.clone().unwrap()]);
         }
 
-        if r.map_owner_id.is_none() {
+        if info.map_owner_id.is_none() {
             table.add_row(vec!["Map Owner ID:", "None"]);
         } else {
             table.add_row(vec![
                 "Map Owner ID:",
-                &r.map_owner_id
+                &info.map_owner_id
                     .map(|i| i.to_string())
                     .unwrap_or("None".to_owned()),
             ]);
         };
 
-        if r.map_used_by.clone().is_empty() {
+        if info.map_used_by.clone().is_empty() {
             table.add_row(vec!["Maps Used By:", "None"]);
         } else {
             let mut first = true;
-            for prog_id in r.clone().map_used_by {
+            for prog_id in info.map_used_by.clone() {
                 if first {
                     first = false;
                     table.add_row(vec!["Maps Used By:", &prog_id]);
@@ -430,79 +439,81 @@ impl ProgTable {
             }
         };
 
-        match r.clone().attach_info.unwrap() {
-            ListAttachInfo::XdpAttachInfo(XdpAttachInfo {
-                priority,
-                iface,
-                position,
-                proceed_on,
-            }) => {
-                let proc_on = match XdpProceedOn::from_int32s(proceed_on) {
-                    Ok(p) => p,
-                    Err(e) => bail!("error parsing proceed_on {e}"),
-                };
+        if !info.attach.is_none() {
+            match info.attach.clone().unwrap().info.unwrap() {
+                Info::XdpAttachInfo(XdpAttachInfo {
+                    priority,
+                    iface,
+                    position,
+                    proceed_on,
+                }) => {
+                    let proc_on = match XdpProceedOn::from_int32s(proceed_on) {
+                        Ok(p) => p,
+                        Err(e) => bail!("error parsing proceed_on {e}"),
+                    };
 
-                table.add_row(vec!["Priority:", &priority.to_string()]);
-                table.add_row(vec!["Iface:", &iface]);
-                table.add_row(vec!["Position:", &position.to_string()]);
-                table.add_row(vec!["Proceed On:", &format!("{proc_on}")]);
-            }
-            ListAttachInfo::TcAttachInfo(TcAttachInfo {
-                priority,
-                iface,
-                position,
-                direction,
-                proceed_on,
-            }) => {
-                let proc_on = match TcProceedOn::from_int32s(proceed_on) {
-                    Ok(p) => p,
-                    Err(e) => bail!("error parsing proceed_on {e}"),
-                };
+                    table.add_row(vec!["Priority:", &priority.to_string()]);
+                    table.add_row(vec!["Iface:", &iface]);
+                    table.add_row(vec!["Position:", &position.to_string()]);
+                    table.add_row(vec!["Proceed On:", &format!("{proc_on}")]);
+                }
+                Info::TcAttachInfo(TcAttachInfo {
+                    priority,
+                    iface,
+                    position,
+                    direction,
+                    proceed_on,
+                }) => {
+                    let proc_on = match TcProceedOn::from_int32s(proceed_on) {
+                        Ok(p) => p,
+                        Err(e) => bail!("error parsing proceed_on {e}"),
+                    };
 
-                table.add_row(vec!["Priority:", &priority.to_string()]);
-                table.add_row(vec!["Iface:", &iface]);
-                table.add_row(vec!["Position:", &position.to_string()]);
-                table.add_row(vec!["Direction:", &direction]);
-                table.add_row(vec!["Proceed On:", &format!("{proc_on}")]);
-            }
-            ListAttachInfo::TracepointAttachInfo(TracepointAttachInfo { tracepoint }) => {
-                table.add_row(vec!["Tracepoint:", &tracepoint]);
-            }
-            ListAttachInfo::KprobeAttachInfo(KprobeAttachInfo {
-                fn_name,
-                offset,
-                retprobe,
-                namespace,
-            }) => {
-                let probe_type = match retprobe {
-                    true => Kretprobe,
-                    false => Kprobe,
-                };
+                    table.add_row(vec!["Priority:", &priority.to_string()]);
+                    table.add_row(vec!["Iface:", &iface]);
+                    table.add_row(vec!["Position:", &position.to_string()]);
+                    table.add_row(vec!["Direction:", &direction]);
+                    table.add_row(vec!["Proceed On:", &format!("{proc_on}")]);
+                }
+                Info::TracepointAttachInfo(TracepointAttachInfo{tracepoint}) => {
+                    table.add_row(vec!["Tracepoint:", &tracepoint]);
+                }
+                Info::KprobeAttachInfo(KprobeAttachInfo{
+                    fn_name,
+                    offset,
+                    retprobe,
+                    namespace,
+                }) => {
+                    let probe_type = match retprobe {
+                        true => Kretprobe,
+                        false => Kprobe,
+                    };
 
-                table.add_row(vec!["Probe Type:", &format!["{probe_type}"]]);
-                table.add_row(vec!["Function Name:", &fn_name]);
-                table.add_row(vec!["Offset:", &offset.to_string()]);
-                table.add_row(vec!["Namespace", &namespace.unwrap_or("".to_string())]);
-            }
-            ListAttachInfo::UprobeAttachInfo(UprobeAttachInfo {
-                fn_name,
-                offset,
-                target,
-                retprobe,
-                pid,
-                namespace,
-            }) => {
-                let probe_type = match retprobe {
-                    true => Uretprobe,
-                    false => Uprobe,
-                };
+                    table.add_row(vec!["Probe Type:", &format!["{probe_type}"]]);
+                    table.add_row(vec!["Function Name:", &fn_name]);
+                    table.add_row(vec!["Offset:", &offset.to_string()]);
+                    table.add_row(vec!["Namespace", &namespace.unwrap_or("".to_string())]);
+                }
+                Info::UprobeAttachInfo(UprobeAttachInfo{
+                    fn_name,
+                    offset,
+                    target,
+                    retprobe,
+                    pid,
+                    namespace,
+                }) => {
+                    let probe_type = match retprobe {
+                        true => Uretprobe,
+                        false => Uprobe,
+                    };
 
-                table.add_row(vec!["Probe Type:", &format!["{probe_type}"]]);
-                table.add_row(vec!["Function Name:", &fn_name.unwrap_or("".to_string())]);
-                table.add_row(vec!["Offset:", &offset.to_string()]);
-                table.add_row(vec!["Target:", &target]);
-                table.add_row(vec!["PID", &pid.unwrap_or(0).to_string()]);
-                table.add_row(vec!["Namespace", &namespace.unwrap_or("".to_string())]);
+                    table.add_row(vec!["Probe Type:", &format!["{probe_type}"]]);
+                    table.add_row(vec!["Function Name:", &fn_name.unwrap_or("".to_string())]);
+                    table.add_row(vec!["Offset:", &offset.to_string()]);
+                    table.add_row(vec!["Target:", &target]);
+                    table.add_row(vec!["PID", &pid.unwrap_or(0).to_string()]);
+                    table.add_row(vec!["Namespace", &namespace.unwrap_or("".to_string())]);
+                }
             }
         }
 
@@ -517,37 +528,36 @@ impl ProgTable {
             .add_attribute(comfy_table::Attribute::Bold)
             .fg(Color::Green)]);
 
+        if r.kernel_info.is_none() {
+            table.add_row(vec!["NONE"]);
+            return Ok(ProgTable(table));
+        }
+        let kernel_info = r.kernel_info.clone().unwrap();
+    
         let rows = vec![
-            vec!["Kernel ID:".to_string(), r.id.to_string()],
-            vec![
-                "Name:".to_string(),
-                r.name
-                    .is_empty()
-                    .then(|| "None".to_string())
-                    .unwrap_or(r.name.clone()),
-            ],
+            vec!["Kernel ID:".to_string(), kernel_info.id.to_string()],
             vec![
                 "Type:".to_string(),
-                format!("{}", ProgramType::try_from(r.program_type)?),
+                format!("{}", ProgramType::try_from(kernel_info.program_type)?),
             ],
-            vec!["Loaded At:".to_string(), r.loaded_at.clone()],
-            vec!["Tag:".to_string(), r.tag.clone()],
-            vec!["GPL Compatible:".to_string(), r.gpl_compatible.to_string()],
-            vec!["Map IDs:".to_string(), format!("{:?}", r.map_ids)],
-            vec!["BTF ID:".to_string(), r.btf_id.to_string()],
+            vec!["Loaded At:".to_string(), kernel_info.loaded_at.clone()],
+            vec!["Tag:".to_string(), kernel_info.tag.clone()],
+            vec!["GPL Compatible:".to_string(), kernel_info.gpl_compatible.to_string()],
+            vec!["Map IDs:".to_string(), format!("{:?}", kernel_info.map_ids)],
+            vec!["BTF ID:".to_string(), kernel_info.btf_id.to_string()],
             vec![
                 "Size Translated (bytes):".to_string(),
-                r.bytes_xlated.to_string(),
+                kernel_info.bytes_xlated.to_string(),
             ],
-            vec!["JITted:".to_string(), r.jited.to_string()],
-            vec!["Size JITted:".to_string(), r.bytes_jited.to_string()],
+            vec!["JITted:".to_string(), kernel_info.jited.to_string()],
+            vec!["Size JITted:".to_string(), kernel_info.bytes_jited.to_string()],
             vec![
                 "Kernel Allocated Memory (bytes):".to_string(),
-                r.bytes_memlock.to_string(),
+                kernel_info.bytes_memlock.to_string(),
             ],
             vec![
                 "Verified Instruction Count:".to_string(),
-                r.verified_insns.to_string(),
+                kernel_info.verified_insns.to_string(),
             ],
         ];
         table.add_rows(rows);
@@ -560,11 +570,23 @@ impl ProgTable {
     }
 
     fn add_response_prog(&mut self, r: ListResult) -> anyhow::Result<()> {
+        if r.kernel_info.is_none() {
+            self.0.add_row(vec!["NONE"]);
+            return Ok(());
+        }
+        let kernel_info = r.kernel_info.unwrap();
+
+        let name = if r.info.is_none() {
+            "".to_string()
+        } else {
+            r.info.unwrap().name
+        };
+
         self.add_row_list(
-            r.id.to_string(),
-            r.name,
-            (ProgramType::try_from(r.program_type)?).to_string(),
-            r.loaded_at,
+            kernel_info.id.to_string(),
+            name,
+            (ProgramType::try_from(kernel_info.program_type)?).to_string(),
+            kernel_info.loaded_at,
         );
 
         Ok(())
@@ -592,7 +614,7 @@ impl LoadCommands {
         }
     }
 
-    fn get_attach_type(&self) -> Result<Option<LoadAttachInfo>, anyhow::Error> {
+    fn get_attach_type(&self) -> Result<Option<AttachInfo>, anyhow::Error> {
         match self {
             LoadCommands::Xdp {
                 iface,
@@ -603,14 +625,16 @@ impl LoadCommands {
                     Ok(p) => p,
                     Err(e) => bail!("error parsing proceed_on {e}"),
                 };
-                Ok(Some(load_request::AttachInfo::XdpAttachInfo(
-                    XdpAttachInfo {
-                        priority: *priority,
-                        iface: iface.to_string(),
-                        position: 0,
-                        proceed_on: proc_on.as_action_vec(),
-                    },
-                )))
+                Ok(Some(AttachInfo{ info: Some(
+                    Info::XdpAttachInfo(
+                        XdpAttachInfo {
+                            priority: *priority,
+                            iface: iface.to_string(),
+                            position: 0,
+                            proceed_on: proc_on.as_action_vec(),
+                        },
+                    )
+                ) }))
             }
             LoadCommands::Tc {
                 direction,
@@ -626,19 +650,27 @@ impl LoadCommands {
                     Ok(p) => p,
                     Err(e) => bail!("error parsing proceed_on {e}"),
                 };
-                Ok(Some(load_request::AttachInfo::TcAttachInfo(TcAttachInfo {
-                    priority: *priority,
-                    iface: iface.to_string(),
-                    position: 0,
-                    direction: direction.to_string(),
-                    proceed_on: proc_on.as_action_vec(),
-                })))
+                Ok(Some(AttachInfo{ info: Some(
+                    Info::TcAttachInfo(
+                        TcAttachInfo {
+                            priority: *priority,
+                            iface: iface.to_string(),
+                            position: 0,
+                            direction: direction.to_string(),
+                            proceed_on: proc_on.as_action_vec(),
+                        },
+                    )
+                ) }))
             }
-            LoadCommands::Tracepoint { tracepoint } => Ok(Some(
-                load_request::AttachInfo::TracepointAttachInfo(TracepointAttachInfo {
-                    tracepoint: tracepoint.to_string(),
-                }),
-            )),
+            LoadCommands::Tracepoint { tracepoint } => {
+                Ok(Some(AttachInfo{ info: Some(
+                    Info::TracepointAttachInfo(
+                        TracepointAttachInfo {
+                            tracepoint: tracepoint.to_string(),
+                        },
+                    )
+                ) }))
+            }
             LoadCommands::Kprobe {
                 fn_name,
                 offset,
@@ -649,14 +681,16 @@ impl LoadCommands {
                     bail!("kprobe namespace option not supported yet");
                 }
                 let offset = offset.unwrap_or(0);
-                Ok(Some(load_request::AttachInfo::KprobeAttachInfo(
-                    KprobeAttachInfo {
-                        fn_name: fn_name.to_string(),
-                        offset,
-                        retprobe: *retprobe,
-                        namespace: namespace.clone(),
-                    },
-                )))
+                Ok(Some(AttachInfo{ info: Some(
+                    Info::KprobeAttachInfo(
+                        KprobeAttachInfo {
+                            fn_name: fn_name.to_string(),
+                            offset,
+                            retprobe: *retprobe,
+                            namespace: namespace.clone(),
+                        },
+                    )
+                ) }))
             }
             LoadCommands::Uprobe {
                 fn_name,
@@ -670,69 +704,51 @@ impl LoadCommands {
                     bail!("uprobe namespace option not supported yet");
                 }
                 let offset = offset.unwrap_or(0);
-                Ok(Some(load_request::AttachInfo::UprobeAttachInfo(
-                    UprobeAttachInfo {
-                        fn_name: fn_name.clone(),
-                        offset,
-                        target: target.clone(),
-                        retprobe: *retprobe,
-                        pid: *pid,
-                        namespace: namespace.clone(),
-                    },
-                )))
+                Ok(Some(AttachInfo{ info: Some(
+                    Info::UprobeAttachInfo(
+                        UprobeAttachInfo {
+                            fn_name: fn_name.clone(),
+                            offset,
+                            target: target.clone(),
+                            retprobe: *retprobe,
+                            pid: *pid,
+                            namespace: namespace.clone(),
+                        },
+                    )
+                ) }))
             }
         }
     }
 }
 
 impl Commands {
-    fn get_request_common(&self) -> anyhow::Result<Option<LoadRequestCommon>> {
+    fn get_bytecode_location(&self) -> anyhow::Result<Option<BytecodeLocation>> {
         match self {
             Commands::LoadFromFile(LoadFileArgs {
                 path,
-                section_name,
-                metadata,
-                global,
-                map_owner_id,
-                command,
-            }) => Ok(Some(LoadRequestCommon {
-                metadata: metadata
-                    .clone()
-                    .unwrap_or(vec![])
-                    .iter()
-                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                    .collect(),
-                location: Some(load_request_common::Location::File(path.clone())),
-                section_name: section_name.to_string(),
-                program_type: command.get_prog_type() as u32,
-                global_data: parse_global(global),
-                map_owner_id: *map_owner_id,
+                section_name: _,
+                global: _,
+                metadata: _,
+                map_owner_id: _,
+                command: _,
+            }) => Ok(Some(BytecodeLocation {
+                location: Some(Location::File(path.clone())),
             })),
             Commands::LoadFromImage(LoadImageArgs {
                 pull_args,
-                section_name,
-                metadata,
-                global,
-                map_owner_id,
-                command,
-            }) => Ok(Some(LoadRequestCommon {
-                metadata: metadata
-                    .clone()
-                    .unwrap_or(vec![])
-                    .iter()
-                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                    .collect(),
-                location: Some(load_request_common::Location::Image(pull_args.try_into()?)),
-                section_name: section_name.to_string(),
-                program_type: command.get_prog_type() as u32,
-                global_data: parse_global(global),
-                map_owner_id: *map_owner_id,
+                section_name: _,
+                global: _,
+                metadata: _,
+                map_owner_id: _,
+                command: _,
+            }) => Ok(Some(BytecodeLocation {
+                location: Some(Location::Image(pull_args.try_into()?)),
             })),
             _ => bail!("Unknown Command"),
         }
     }
 
-    fn get_attach_info(&self) -> anyhow::Result<Option<LoadAttachInfo>> {
+    fn get_attach_info(&self) -> anyhow::Result<Option<AttachInfo>> {
         match self {
             Commands::LoadFromFile(l) => l.command.get_attach_type(),
             Commands::LoadFromImage(l) => l.command.get_attach_type(),
@@ -882,23 +898,64 @@ async fn execute_request_tcp(
 async fn execute_request(command: &Commands, channel: Channel) -> anyhow::Result<()> {
     let mut client = BpfdClient::new(channel);
     match command {
-        Commands::LoadFromFile(_) | Commands::LoadFromImage(_) => {
-            let attach_info = match command.get_attach_info() {
+        Commands::LoadFromImage(l) => {
+            let bytecode = match command.get_bytecode_location() {
                 Ok(t) => t,
                 Err(e) => bail!(e),
             };
 
-            let common = match command.get_request_common() {
+            let attach = match command.get_attach_info() {
                 Ok(t) => t,
                 Err(e) => bail!(e),
             };
 
             let request = tonic::Request::new(LoadRequest {
-                common,
-                attach_info,
+                bytecode,
+                name: l.section_name.to_string(),
+                program_type: l.command.get_prog_type() as u32,
+                attach,
+                metadata: l.metadata
+                    .clone()
+                    .unwrap_or(vec![])
+                    .iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect(),
+                global_data: parse_global(&l.global),
+                uuid: None,
+                map_owner_id: l.map_owner_id,
             });
             let response = client.load(request).await?.into_inner();
-            println!("{}", response.id);
+            println!("{}", response.kernel_info.unwrap().id);
+        }
+
+        Commands::LoadFromFile(l) => {
+            let bytecode = match command.get_bytecode_location() {
+                Ok(t) => t,
+                Err(e) => bail!(e),
+            };
+
+            let attach = match command.get_attach_info() {
+                Ok(t) => t,
+                Err(e) => bail!(e),
+            };
+
+            let request = tonic::Request::new(LoadRequest {
+                bytecode,
+                name: l.section_name.to_string(),
+                program_type: l.command.get_prog_type() as u32,
+                attach,
+                metadata: l.metadata
+                    .clone()
+                    .unwrap_or(vec![])
+                    .iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect(),
+                global_data: parse_global(&l.global),
+                uuid: None,
+                map_owner_id: l.map_owner_id,
+            });
+            let response = client.load(request).await?.into_inner();
+            println!("{}", response.kernel_info.unwrap().id);
         }
 
         Commands::Unload(l) => {
@@ -940,7 +997,7 @@ async fn execute_request(command: &Commands, channel: Channel) -> anyhow::Result
             let prog = response
                 .results
                 .iter()
-                .find(|r| r.id == *id)
+                .find(|r| r.kernel_info.clone().unwrap().id == *id)
                 .unwrap_or_else(|| panic!("No program with ID {}", id));
 
             ProgTable::new_get_bpfd(prog)?.print();
